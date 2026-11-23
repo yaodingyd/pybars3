@@ -307,7 +307,137 @@ class TestApi(unittest.TestCase):
             raise AssertionError("pybars' shared CodeBuilder was used")
 
         with mock.patch.object(pybars.Compiler._builder, 'start', trap):
-            self.assertIsNone(pybars_rs._self_check(pybars_rs._GENERATE_CODE, pybars.__version__))
+            self.assertIsNone(pybars_rs._self_check(pybars.__version__))
+
+    def test_importing_with_debug_or_low_recursion_limit_keeps_rust_available(self):
+        script = (
+            'import pybars._compiler\n'
+            'pybars._compiler.debug = True\n'
+            'import pybars_rs\n'
+            'pybars._compiler.debug = False\n'
+            'assert pybars_rs.is_available(), pybars_rs.unavailable_reason()\n'
+            "assert pybars_rs.precompile('{{a}}') == pybars.Compiler().precompile('{{a}}')\n"
+            "assert pybars_rs.counters()['fast_path'] == 1, pybars_rs.counters()\n"
+        )
+        run_python(script)
+
+        low_limit_script = (
+            'import contextvars, hashlib, os, platform, sys, types, unicodedata, pybars\n'
+            'def depth():\n'
+            '    d, f = 0, sys._getframe()\n'
+            '    while f:\n'
+            '        d, f = d + 1, f.f_back\n'
+            '    return d\n'
+            'previous = sys.getrecursionlimit()\n'
+            'sys.setrecursionlimit(depth() + 35)\n'
+            'try:\n'
+            '    import pybars_rs\n'
+            'finally:\n'
+            '    sys.setrecursionlimit(previous)\n'
+            'assert pybars_rs.is_available(), pybars_rs.unavailable_reason()\n'
+            "assert pybars_rs.precompile('{{a}}') == pybars.Compiler().precompile('{{a}}')\n"
+            "assert pybars_rs.counters()['fast_path'] == 1, pybars_rs.counters()\n"
+        )
+        run_python(low_limit_script)
+
+    def test_compiler_hook_overrides_fall_back_to_pybars(self):
+        # Subclasses or instances that override the hooks pybars'
+        # `_generate_code` calls must run pybars rather than the fast path.
+        if hasattr(pybars.Compiler, 'whitespace_control'):
+            class NoWS(pybars.Compiler):
+                def whitespace_control(self, source):
+                    return source
+
+            class NoWS_RS(pybars_rs.Compiler):
+                def whitespace_control(self, source):
+                    return source
+
+            before = pybars_rs.counters()['custom_compiler']
+            self.assertEqual(
+                outcome(lambda: NoWS_RS().precompile('a {{~b~}} c')),
+                outcome(lambda: NoWS().precompile('a {{~b~}} c')),
+            )
+            self.assertEqual(pybars_rs.counters()['custom_compiler'], before + 1)
+
+            instance = pybars_rs.Compiler()
+            instance.whitespace_control = lambda source: source
+            self.assertEqual(
+                outcome(lambda: instance.precompile('a {{~b~}} c')),
+                outcome(lambda: NoWS().precompile('a {{~b~}} c')),
+            )
+        else:
+            class NoClean(pybars.Compiler):
+                def clean_whitespace(self, tree):
+                    pass
+
+            class NoClean_RS(pybars_rs.Compiler):
+                def clean_whitespace(self, tree):
+                    pass
+
+            before = pybars_rs.counters()['custom_compiler']
+            self.assertEqual(
+                outcome(lambda: NoClean_RS().precompile('{{#if a}}\nbody\n{{/if}}\n')),
+                outcome(lambda: NoClean().precompile('{{#if a}}\nbody\n{{/if}}\n')),
+            )
+            self.assertEqual(pybars_rs.counters()['custom_compiler'], before + 1)
+
+            instance = pybars_rs.Compiler()
+            instance.clean_whitespace = lambda tree: None
+            self.assertEqual(
+                outcome(lambda: instance.precompile('{{#if a}}\nbody\n{{/if}}\n')),
+                outcome(lambda: NoClean().precompile('{{#if a}}\nbody\n{{/if}}\n')),
+            )
+
+        class CustomWord(pybars.Compiler):
+            def _extract_word(self, source, position):
+                return 'CUSTOM'
+
+        class CustomWord_RS(pybars_rs.Compiler):
+            def _extract_word(self, source, position):
+                return 'CUSTOM'
+
+        self.assertEqual(
+            outcome(lambda: CustomWord_RS().precompile('{{a}')),
+            outcome(lambda: CustomWord().precompile('{{a}')),
+        )
+
+        # Subclass overriding `_compiler` or `__getattribute__` falls back too.
+        class CustomGrammar_RS(pybars_rs.Compiler):
+            _compiler = pybars_rs._new_compile_grammar()
+
+        before = pybars_rs.counters()['custom_compiler']
+        self.assertEqual(CustomGrammar_RS().precompile('{{a}}'), pybars.Compiler().precompile('{{a}}'))
+        self.assertEqual(pybars_rs.counters()['custom_compiler'], before + 1)
+
+        class CustomGetAttr_RS(pybars_rs.Compiler):
+            def __getattribute__(self, name):
+                return super().__getattribute__(name)
+
+        before = pybars_rs.counters()['custom_compiler']
+        self.assertEqual(CustomGetAttr_RS().precompile('{{a}}'), pybars.Compiler().precompile('{{a}}'))
+        self.assertEqual(pybars_rs.counters()['custom_compiler'], before + 1)
+
+        # Unbound call with a non-Compiler `self` fails like pybars; an
+        # unmodified `pybars.Compiler` instance still takes the fast path.
+        self.assertEqual(
+            outcome(lambda: pybars_rs.Compiler._generate_code(None, '{{a}}')),
+            outcome(lambda: pybars.Compiler._generate_code(None, '{{a}}')),
+        )
+        before = pybars_rs.counters()['fast_path']
+        self.assertEqual(
+            pybars_rs.Compiler._generate_code(pybars.Compiler(), '{{a}}').full_code,
+            pybars.Compiler().precompile('{{a}}'),
+        )
+        self.assertEqual(pybars_rs.counters()['fast_path'], before + 1)
+
+        # A subclass that does not override compilation hooks stays on the fast path.
+        class BenignSubclass(pybars_rs.Compiler):
+            def extra(self):
+                return True
+
+        before = pybars_rs.counters()['fast_path']
+        self.assertEqual(BenignSubclass().precompile('{{a}}'), pybars.Compiler().precompile('{{a}}'))
+        self.assertEqual(pybars_rs.counters()['fast_path'], before + 1)
 
     def test_the_extension_module_reports_the_port_alone(self):
         versions = {'pybars_version': pybars.__version__, 'unicode_version': unicodedata.unidata_version}
@@ -391,6 +521,7 @@ class TestApi(unittest.TestCase):
             'unavailable',
             'debug',
             'not_str',
+            'custom_compiler',
             'surrogates',
             'int_conversion',
             'nesting_depth',

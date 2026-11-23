@@ -204,8 +204,10 @@ def _new_compile_grammar():
 _COMPILE_GRAMMAR = _new_compile_grammar()
 _BUILDER = _COMPILE_GRAMMAR.globals['builder']
 
-# The compile grammar of the fallback running in this context: the native
-# `_generate_code` sets it around each call to pybars' own.
+# The compile grammar slot of the fallback running in this context: a
+# one-element list `[grammar_or_None]` set by native `fall_back`, or None
+# outside a fallback. Creating a new grammar is deferred until `_compiler` is
+# read, so fallbacks that fail before code generation add no Python frames.
 _FALLBACK_GRAMMAR = contextvars.ContextVar('pybars_rs_fallback_grammar', default=None)
 
 
@@ -219,29 +221,38 @@ class _CompileGrammar:
     __slots__ = ()
 
     def __get__(self, instance, owner=None):
-        grammar = _FALLBACK_GRAMMAR.get()
-        return _COMPILE_GRAMMAR if grammar is None else grammar
+        slot = _FALLBACK_GRAMMAR.get()
+        if slot is None:
+            return _COMPILE_GRAMMAR
+        grammar = slot[0]
+        if grammar is None:
+            grammar = _new_compile_grammar()
+            slot[0] = grammar
+        return grammar
+
+
+_COMPILE_GRAMMAR_DESCRIPTOR = _CompileGrammar()
 
 
 def _generate_code(pybars_version, unicode_version):
     return _native.GenerateCode(
         original=pybars.Compiler._generate_code,
+        compiler_class=pybars.Compiler,
+        compile_grammar_descriptor=_COMPILE_GRAMMAR_DESCRIPTOR,
         function_container=pybars._compiler.FunctionContainer,
         compiler_module=pybars._compiler,
         error_class=PybarsError,
-        new_compile_grammar=_new_compile_grammar,
         fallback_grammar=_FALLBACK_GRAMMAR,
         pybars_version=pybars_version,
         unicode_version=unicode_version,
     )
 
 
-def _self_check(generate_code, version):
+def _self_check(version):
     """
-    Compiles a few templates with the Rust compiler alone
-
-    :param generate_code:
-        The native ``_generate_code``
+    Compiles a few templates with the Rust compiler alone, independent of
+    transient runtime settings such as ``pybars._compiler.debug`` or the
+    caller's stack depth
 
     :param version:
         The pybars3 release whose compiler is installed
@@ -250,14 +261,26 @@ def _self_check(generate_code, version):
         Why the Rust compiler disagrees with pybars on them, or None
     """
 
+    header = _native.HEADERS[version]
+    unicode_version = unicodedata.unidata_version
     for template, digest in zip(_SELF_CHECK_TEMPLATES, _SELF_CHECK[version]):
         try:
-            result = generate_code.try_fast_path(template)
+            result = _native.precompile(
+                template,
+                pybars_version=version,
+                unicode_version=unicode_version,
+            )
+            if result[0] == 'fallback':
+                return 'a self-check template fell back to pybars (%s)' % result[1]
+            if result[0] == 'error':
+                return 'a self-check template raised PybarsError: %s' % result[1]
+            code = result[1]
+            if not code.startswith(header):
+                return 'a self-check template had an unexpected header'
+            full_code = pybars._compiler.FunctionContainer('render', code[len(header):]).full_code
         except Exception as error:  # any failure means "use pybars"
             return 'a self-check template raised %s: %s' % (type(error).__name__, error)
-        if isinstance(result, str):
-            return 'a self-check template fell back to pybars (%s)' % result
-        if hashlib.sha256(result.full_code.encode('utf-8')).hexdigest() != digest:
+        if hashlib.sha256(full_code.encode('utf-8')).hexdigest() != digest:
             return 'a self-check template compiled differently from pybars'
     return None
 
@@ -265,10 +288,9 @@ def _self_check(generate_code, version):
 def _build():
     version, problem = _environment()
     if problem is None:
-        generate_code = _generate_code(version, unicodedata.unidata_version)
-        problem = _self_check(generate_code, version)
+        problem = _self_check(version)
         if problem is None:
-            return generate_code, None
+            return _generate_code(version, unicodedata.unidata_version), None
     return _generate_code(None, None), problem
 
 
@@ -310,7 +332,7 @@ class Compiler(pybars.Compiler):
     """
 
     _builder = _BUILDER
-    _compiler = _CompileGrammar()
+    _compiler = _COMPILE_GRAMMAR_DESCRIPTOR
     _generate_code = _NativeMethod(_GENERATE_CODE)
 
 
@@ -352,9 +374,9 @@ def counters():
     Counts the compiles that the Rust compiler answered (``fast_path``), and
     the ones that ran pybars, by reason: ``unavailable`` (the Rust compiler is
     disabled, see ``unavailable_reason()``), ``debug``, ``not_str``,
-    ``surrogates``, ``int_conversion``, ``nesting_depth``, and ``panic`` and
-    ``internal``, which mean a bug in pybars_rs that running pybars hid: please
-    report them.
+    ``custom_compiler``, ``surrogates``, ``int_conversion``,
+    ``nesting_depth``, and ``panic`` and ``internal``, which mean a bug in
+    pybars_rs that running pybars hid: please report them.
 
     :return:
         A dict of counts by name

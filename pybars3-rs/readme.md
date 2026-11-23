@@ -78,8 +78,8 @@ at the same stack depth and raises exactly what pybars raises.
 ```python
 pybars_rs.counters()
 # {'fast_path': 1520, 'unavailable': 0, 'debug': 0, 'not_str': 0,
-#  'surrogates': 0, 'int_conversion': 1, 'nesting_depth': 0,
-#  'panic': 0, 'internal': 0}
+#  'custom_compiler': 0, 'surrogates': 0, 'int_conversion': 1,
+#  'nesting_depth': 0, 'panic': 0, 'internal': 0}
 ```
 
 `panic` and `internal` count calls on which the Rust compiler failed in a way

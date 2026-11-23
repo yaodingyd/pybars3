@@ -185,3 +185,40 @@ class TestRecursion(unittest.TestCase):
         # does not.
         script = BOUNDARY_SCRIPT.format(source='"a\\ud800b {{x}}"', reason='surrogates')
         run_in_a_fresh_interpreter(script)
+
+    def test_non_str_matches_pybars_at_every_recursion_limit(self):
+        # Even on the very first fallback, when no idle compile grammar is
+        # pooled yet, failing before code generation must not add Python frames.
+        script = """
+import sys, warnings
+warnings.simplefilter("ignore")
+sys.path.insert(0, sys.argv[1])
+import pybars, pybars_rs
+from tests import parity
+
+def at_limit(compiler_cls, limit):
+    compiler = compiler_cls()
+    previous = sys.getrecursionlimit()
+    sys.setrecursionlimit(limit)
+    try:
+        try:
+            return ('ok', compiler.precompile(b"not a str"))
+        except BaseException as error:
+            return (type(error).__name__, str(error))
+    finally:
+        sys.setrecursionlimit(previous)
+
+floor = parity.stack_depth()
+saw_pybars_error = False
+for delta in range(2, 12):
+    limit = floor + delta
+    expected = at_limit(pybars.Compiler, limit)
+    actual = at_limit(pybars_rs.Compiler, limit)
+    assert expected == actual, (delta, expected, actual)
+    if expected[0] == 'PybarsError':
+        saw_pybars_error = True
+assert saw_pybars_error
+"""
+        run_in_a_fresh_interpreter(script)
+        environment = dict(os.environ, PYTHONWARNINGS='ignore', PYBARS_RS_DISABLE='1')
+        subprocess.run([sys.executable, '-c', script, TESTS_ROOT], check=True, env=environment)
